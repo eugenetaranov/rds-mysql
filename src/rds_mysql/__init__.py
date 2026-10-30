@@ -20,8 +20,10 @@ import time
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import NoCredentialsError, NoRegionError, ProfileNotFound
 from iterfzf import iterfzf
 from rich.console import Console
+from rich.markup import escape
 
 console = Console()
 
@@ -321,3 +323,18 @@ def run():
         main()
     except KeyboardInterrupt:
         print("\nCancelled.")
+    except (NoRegionError, ProfileNotFound, NoCredentialsError) as e:
+        console.print(f"[red]{escape(aws_problem(e))}[/red]")
+        sys.exit(1)
+
+
+def aws_problem(e: Exception) -> str:
+    """What's missing from the AWS setup, and where to put it."""
+    p = profile()
+    section = 'default' if p == 'default' else f'profile {p}'
+    if isinstance(e, NoRegionError):
+        return (f"No AWS region for profile {p}: add 'region = <region>' under [{section}] "
+                "in ~/.aws/config, or export AWS_REGION.")
+    if isinstance(e, ProfileNotFound):
+        return f"No AWS profile {p} in ~/.aws/config or ~/.aws/credentials."
+    return f"No AWS credentials for profile {p}: log in (aws sso login) or add its keys to ~/.aws/credentials."

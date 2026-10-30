@@ -136,3 +136,17 @@ def test_forget_asks_again(env):
     env.save('/a/good')
     env.run(['rw', 'type'], '-f', password='pw-good')
     assert env.saved() == {}
+
+
+def test_aws_setup_problems_say_what_to_fix(monkeypatch, capsys):
+    from botocore.exceptions import NoRegionError
+    monkeypatch.setenv('AWS_PROFILE', 'prod')
+
+    def no_region():
+        raise NoRegionError()
+    monkeypatch.setattr(rds_mysql, 'main', no_region)
+    with pytest.raises(SystemExit) as e:
+        rds_mysql.run()
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "[profile prod]" in out and "~/.aws/config" in out
