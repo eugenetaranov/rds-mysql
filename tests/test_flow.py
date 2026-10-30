@@ -9,9 +9,12 @@ import pytest
 
 import rds_mysql
 
-PARAMS = {'/a/good': 'pw-good', '/a/bad': 'pw-bad', '/a/down': 'pw-down'}
+PARAMS = {'/a/good': 'pw-good', '/a/bad': 'pw-bad', '/a/down': 'pw-down',
+          '/a/json': '{"username": "app", "password": "pw-good"}',
+          '/u/name': 'app\n'}
 
 FAKE_MYSQL = """#!/bin/sh
+case "$*" in *--ssl-ca=*) ;; *) echo "ERROR 2026 (HY000): TLS/SSL error: certificate verify failed" >&2; exit 1;; esac
 case "$*" in *"SELECT 1"*)
   [ "$MYSQL_PWD" = pw-good ] && exit 0
   [ "$MYSQL_PWD" = pw-down ] && { echo "ERROR 2003 (HY000): Can't connect" >&2; exit 1; }
@@ -59,6 +62,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(rds_mysql, 'CACHE_DIR', tmp_path / 'cache')
     monkeypatch.setattr(rds_mysql, 'CONFIG_FILE', tmp_path / 'cfg' / 'config.json')
     monkeypatch.setattr(rds_mysql.boto3, 'client', lambda _: FakeClient())
+    monkeypatch.setattr(rds_mysql, 'rds_ca', lambda refresh=False: tmp_path / 'ca.pem')
 
     execs = []
     monkeypatch.setattr(rds_mysql.os, 'execvp',
@@ -67,7 +71,7 @@ def env(tmp_path, monkeypatch):
     class Env:
         exec_calls = execs
 
-        def run(self, answers, *args, password=None):
+        def run(self, answers, *args, password=None, user='app'):
             """Run with fzf answering from answers (the first item starting
             with each), and getpass returning password."""
             it = iter(answers)
@@ -79,12 +83,13 @@ def env(tmp_path, monkeypatch):
 
             monkeypatch.setattr(rds_mysql, 'iterfzf', fzf)
             monkeypatch.setattr(rds_mysql.getpass, 'getpass', lambda _: password)
-            monkeypatch.setattr(sys, 'argv', ['rds-mysql', '-u', 'app', *args])
+            monkeypatch.setattr(sys, 'argv', ['rds-mysql', *(['-u', user] if user else []), *args])
             rds_mysql.main()
 
-        def saved(self):
+        def saved(self, raw=False):
             try:
-                return json.loads(rds_mysql.CONFIG_FILE.read_text())['default']['prod-api']
+                saved = json.loads(rds_mysql.CONFIG_FILE.read_text())['default']['prod-api']
+                return saved if raw else {u: p for u, p in saved.items() if u != '@user'}
             except FileNotFoundError:
                 return {}
 
@@ -150,3 +155,47 @@ def test_aws_setup_problems_say_what_to_fix(monkeypatch, capsys):
     assert e.value.code == 1
     out = capsys.readouterr().out
     assert "[profile prod]" in out and "~/.aws/config" in out
+
+
+def test_a_json_parameter_gives_its_password(env):
+    env.run(['rw', 'ssm', '/a/json'])
+    assert env.saved() == {'app': '/a/json'}
+    assert env.exec_calls[-1][1] == 'pw-good'
+
+
+def test_mysql_checks_the_server_against_the_rds_ca(env):
+    env.run(['rw', 'ssm', '/a/good'])
+    argv = env.exec_calls[-1][0]
+    assert any(a.startswith('--ssl-ca=') and a.endswith('ca.pem') for a in argv)
+
+
+def test_the_ssm_search_starts_empty(env, monkeypatch):
+    """The parameter picker opens on every name, not filtered by the user."""
+    queries = []
+    select = rds_mysql.select_parameter
+
+    def spy(ssm, prompt):
+        fzf = rds_mysql.iterfzf
+        rds_mysql.iterfzf = lambda items, query=None, **kw: queries.append(query) or fzf(items, query=query, **kw)
+        try:
+            return select(ssm, prompt)
+        finally:
+            rds_mysql.iterfzf = fzf
+    monkeypatch.setattr(rds_mysql, 'select_parameter', spy)
+    env.run(['rw', 'ssm', '/a/good'])
+    assert queries == [None]
+
+
+def test_the_user_name_from_ssm_is_remembered(env):
+    env.run(['rw', 'ssm', '/u/name', 'ssm', '/a/good'], user=None)
+    assert env.exec_calls[-1][0][-1] == 'app' and env.exec_calls[-1][1] == 'pw-good'
+    assert env.saved(raw=True) == {'app': '/a/good', '@user': '/u/name'}
+    # Next time: read again and offered first, its password saved.
+    env.run(['rw', 'app'], user=None)
+    assert env.exec_calls[-1][1] == 'pw-good'
+
+
+def test_a_json_user_parameter_gives_the_password_too(env):
+    env.run(['rw', 'ssm', '/a/json'], user=None)
+    assert env.exec_calls[-1][0][-1] == 'app' and env.exec_calls[-1][1] == 'pw-good'
+    assert env.saved(raw=True) == {'app': '/a/json', '@user': '/a/json'}

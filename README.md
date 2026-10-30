@@ -17,7 +17,22 @@ uv tool install git+https://github.com/eugenetaranov/rds-mysql
 ```
 
 It needs the `mysql` client (MySQL's, or MariaDB's `mariadb-client`) and
-AWS credentials for the profile you're in (`AWS_PROFILE`).
+AWS credentials and a region for the profile you're in (`AWS_PROFILE`).
+
+`mysql` checks the cluster's TLS certificate against Amazon's RDS CA
+certificates, fetched once from
+`truststore.pki.rds.amazonaws.com` into `~/.cache/rds-mysql` (`-r`
+fetches them again). MariaDB's client (11.4 and later) won't connect to
+RDS without them.
+
+## Who you connect as
+
+The user picker lists the users you've connected as before; type a name
+to use a new one, or pick **ssm** to search Parameter Store for a
+parameter holding the user name. That parameter is remembered for the
+cluster once a login works, and read again each time, so a renamed user
+follows. A parameter whose value is JSON gives its `username`, and its
+`password` too when it has one.
 
 ## How it finds the password
 
@@ -25,7 +40,7 @@ The first time you connect as a user, rds-mysql asks where the password
 is:
 
 - **SSM Parameter Store**: a fuzzy search over the account's parameter
-  names, starting with the user's name. Once the password logs in, the
+  names (a JSON value gives its `password`). Once the password logs in, the
   parameter's path (never the password) is saved for that AWS profile,
   cluster and user in `~/.config/rds-mysql/config.json`, and the next
   time you connect straight away.

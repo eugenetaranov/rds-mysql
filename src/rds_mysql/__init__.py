@@ -6,8 +6,10 @@ over the parameter names) or typed in. A parameter you pick is
 remembered for that profile, cluster and user in
 ~/.config/rds-mysql/config.json (its path only, never the password), so
 next time it connects straight away; -f forgets it and asks again.
-Cluster and parameter names are cached per profile for a week (-r
-refreshes); passwords never are.
+The user name can come from a parameter too (remembered the same way,
+read again each time). Cluster and parameter names are cached per
+profile for a week (-r refreshes); passwords never are. mysql checks the
+server against Amazon's RDS CA certificates, fetched once.
 """
 
 import argparse
@@ -17,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import boto3
@@ -30,6 +33,9 @@ console = Console()
 CACHE_DIR = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'rds-mysql'
 CONFIG_FILE = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'rds-mysql' / 'config.json'
 CACHE_TTL = 7 * 24 * 3600
+# Amazon's CA for RDS: not in the system's trust store, and MariaDB's
+# mysql client (11.4+) verifies the server's certificate by default.
+RDS_CA_URL = 'https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem'
 
 
 def profile() -> str:
@@ -54,8 +60,13 @@ def cached(name: str, fetch, refresh: bool = False, status: str = "Fetching...")
     return data
 
 
+# The key a cluster's user-name parameter is saved under, beside its users.
+USER_PARAM = '@user'
+
+
 class Config:
-    """Saved SSM paths: {profile: {cluster: {user: parameter path}}}."""
+    """Saved SSM paths: {profile: {cluster: {user: parameter path}}}, and
+    under "@user" the parameter the user name came from."""
 
     def __init__(self):
         try:
@@ -64,7 +75,11 @@ class Config:
             self.data = {}
 
     def users(self, cluster_id: str) -> dict[str, str]:
-        return self.data.get(profile(), {}).get(cluster_id, {})
+        saved = self.data.get(profile(), {}).get(cluster_id, {})
+        return {u: p for u, p in saved.items() if u != USER_PARAM}
+
+    def user_param(self, cluster_id: str) -> str | None:
+        return self.data.get(profile(), {}).get(cluster_id, {}).get(USER_PARAM)
 
     def set(self, cluster_id: str, user: str, path: str | None):
         users = self.data.setdefault(profile(), {}).setdefault(cluster_id, {})
@@ -112,9 +127,12 @@ class SSMClient:
         self.client = boto3.client('ssm')
         self.refresh = refresh
 
+    def get_value(self, path: str) -> str:
+        return self.client.get_parameter(Name=path, WithDecryption=True)['Parameter']['Value']
+
     def get_parameter(self, path: str) -> str:
-        resp = self.client.get_parameter(Name=path, WithDecryption=True)
-        return resp['Parameter']['Value']
+        """The password in a parameter."""
+        return password_of(self.get_value(path))
 
     def fetch_names(self) -> list[str]:
         paginator = self.client.get_paginator('describe_parameters')
@@ -126,25 +144,87 @@ class SSMClient:
                       refresh=self.refresh, status="Fetching SSM parameter names...")
 
 
-def select_user(saved: dict[str, str], given: str | None) -> str | None:
+def field_of(value: str, *keys: str) -> str | None:
+    """The first of keys in a parameter's value, when it's a JSON object
+    ({"username": ..., "password": ...}); otherwise None."""
+    if not value.lstrip().startswith('{'):
+        return None
+    try:
+        v = json.loads(value)
+    except ValueError:
+        return None
+    if isinstance(v, dict):
+        for k in keys:
+            if isinstance(v.get(k), str):
+                return v[k]
+    return None
+
+
+def password_of(value: str) -> str:
+    """The password in a parameter's value: its "password" in JSON, or the value."""
+    return field_of(value, 'password') or value
+
+
+def username_of(value: str) -> str:
+    """The user name in a parameter's value: its "username" (or "user") in
+    JSON, or the value."""
+    return (field_of(value, 'username', 'user') or value).strip()
+
+
+def rds_ca(refresh: bool = False) -> Path:
+    """Amazon's RDS CA bundle, fetched once into the cache."""
+    path = CACHE_DIR / 'rds-global-bundle.pem'
+    if refresh or not path.exists():
+        with console.status("Fetching the RDS CA certificates..."):
+            with urllib.request.urlopen(RDS_CA_URL, timeout=15) as r:
+                pem = r.read()
+        if b'BEGIN CERTIFICATE' not in pem:
+            raise OSError(f"{RDS_CA_URL} returned no certificates")
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_bytes(pem)
+        tmp.replace(path)
+    return path
+
+
+SSM_USER = 'ssm   search Parameter Store for the user name'
+
+
+def select_user(ssm: 'SSMClient', config: Config, cluster_id: str,
+                given: str | None) -> tuple[str | None, str | None, str | None]:
+    """Who to connect as: given (-u), a saved user, one typed in, or one
+    read from an SSM parameter. Returns (user, the parameter it came from,
+    the password when that parameter holds one too)."""
     if given:
-        return given.strip()
-    if not saved:
+        return given.strip(), None, None
+    users = sorted(config.users(cluster_id))
+    # The saved user-name parameter, read again: the name may have changed.
+    if path := config.user_param(cluster_id):
         try:
-            return input('DB user: ').strip() or None
-        except EOFError:
-            return None
-    # Saved users first; typing a name that isn't listed connects as it
-    query, selected = iterfzf(sorted(saved), prompt='Select user (or type a new one)> ', print_query=True)
-    return (selected or query or '').strip() or None
+            with console.status(f"Fetching {path}..."):
+                name = username_of(ssm.get_value(path))
+            users = [name] + [u for u in users if u != name]
+        except ssm.client.exceptions.ParameterNotFound:
+            console.print(f"[yellow]Saved parameter {path} is gone.[/yellow]")
+            config.set(cluster_id, USER_PARAM, None)
+    # Typing a name that isn't listed connects as it
+    query, selected = iterfzf(users + [SSM_USER], prompt='Select user (or type a new one)> ', print_query=True)
+    if selected != SSM_USER:
+        return (selected or query or '').strip() or None, None, None
+    path = select_parameter(ssm, 'SSM parameter with the user name> ')
+    if not path:
+        return None, None, None
+    with console.status(f"Fetching {path}..."):
+        value = ssm.get_value(path)
+    return username_of(value) or None, path, field_of(value, 'password')
 
 
-def select_parameter(ssm: SSMClient, cluster_id: str, user: str) -> str | None:
+def select_parameter(ssm: SSMClient, prompt: str) -> str | None:
     names = ssm.list_names()
     if not names:
         console.print("[red]No SSM parameters in this account and region.[/red]")
         return None
-    return iterfzf(names, prompt=f'SSM parameter with {user}\'s password> ', query=user)
+    return iterfzf(names, prompt=prompt)
 
 
 def ask_password(ssm: SSMClient, cluster_id: str, user: str) -> tuple[str | None, str | None]:
@@ -160,19 +240,19 @@ def ask_password(ssm: SSMClient, cluster_id: str, user: str) -> tuple[str | None
             return getpass.getpass(f'Password for {user}: '), None
         except EOFError:
             return None, None
-    path = select_parameter(ssm, cluster_id, user)
+    path = select_parameter(ssm, f'SSM parameter with {user}\'s password> ')
     if not path:
         return None, None
     with console.status(f"Fetching {path}..."):
         return ssm.get_parameter(path), path
 
 
-def check_login(endpoint: str, username: str, password: str) -> str | None:
+def check_login(endpoint: str, username: str, password: str, ca: Path) -> str | None:
     """Log in once with SELECT 1. None when it works, else mysql's error;
     an access-denied error starts with ERROR 1045."""
     with console.status(f"Logging in to {endpoint} as {username}..."):
         r = subprocess.run(
-            ['mysql', '--connect-timeout=5', '-h', endpoint, '-u', username,
+            ['mysql', '--connect-timeout=5', f'--ssl-ca={ca}', '-h', endpoint, '-u', username,
              '--batch', '--skip-column-names', '-e', 'SELECT 1'],
             env={**os.environ, 'MYSQL_PWD': password},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -219,7 +299,7 @@ def get_env_color(env: str) -> str:
         return '\033[0;32m'  # Green
 
 
-def connect_mysql(endpoint: str, username: str, password: str, env: str, execute: str | None = None):
+def connect_mysql(endpoint: str, username: str, password: str, env: str, ca: Path, execute: str | None = None):
     console.print(f"[yellow]Connecting to MySQL on [bold]{endpoint}[/bold]...[/yellow]")
 
     print(get_env_color(env))
@@ -227,7 +307,8 @@ def connect_mysql(endpoint: str, username: str, password: str, env: str, execute
     os.environ['MYSQL_PWD'] = password
     argv = [
         'mysql',
-        '--connect-timeout=2',
+        '--connect-timeout=5',
+        f'--ssl-ca={ca}',
         '--auto-vertical-output',
         '--no-auto-rehash',  # -A: skip table/column completion load for a fast connect
         '-h', endpoint,
@@ -272,16 +353,25 @@ def main():
         sys.exit(1)
 
     config = Config()
-    user = select_user(config.users(cluster_id), args.user)
+    ssm = SSMClient(refresh=args.refresh)
+    user, user_path, user_password = select_user(ssm, config, cluster_id, args.user)
     if not user:
         sys.exit(1)
 
-    ssm = SSMClient(refresh=args.refresh)
+    try:
+        ca = rds_ca(refresh=args.refresh)
+    except OSError as e:
+        console.print(f"[red]Can't get Amazon's RDS CA certificates ({escape(str(e))}); "
+                      "mysql needs them to check the server.[/red]")
+        sys.exit(1)
     if args.forget:
         config.set(cluster_id, user, None)
 
     password = None
     saved = path = config.users(cluster_id).get(user)
+    # The user-name parameter holds the password too ({"username", "password"})
+    if user_password is not None and not saved:
+        password, path = user_password, user_path
     if path:
         try:
             with console.status(f"Fetching {path}..."):
@@ -298,10 +388,13 @@ def main():
             password, path = ask_password(ssm, cluster_id, user)
             if password is None:
                 sys.exit(1)
-        err = check_login(endpoint, user, password)
+        err = check_login(endpoint, user, password, ca)
         if err is None:
             break
-        console.print(f"[red]{err}[/red]")
+        console.print(f"[red]{escape(err)}[/red]")
+        if 'SSL' in err or 'TLS' in err or 'certificate' in err:
+            console.print(f"[yellow]The server's certificate didn't check out against {ca}: "
+                          "-r fetches Amazon's RDS CA certificates again.[/yellow]")
         if not err.startswith('ERROR 1045'):
             sys.exit(1)
         if saved and path == saved:
@@ -314,8 +407,11 @@ def main():
     if path and path != saved:
         config.set(cluster_id, user, path)
         console.print(f"[dim]Saved {path} for {user} on {cluster_id} ({CONFIG_FILE}).[/dim]")
+    if user_path and user_path != config.user_param(cluster_id):
+        config.set(cluster_id, USER_PARAM, user_path)
+        console.print(f"[dim]Saved {user_path} as the user name for {cluster_id}.[/dim]")
 
-    connect_mysql(endpoint, user, password, env, execute=args.execute)
+    connect_mysql(endpoint, user, password, env, ca, execute=args.execute)
 
 
 def run():
