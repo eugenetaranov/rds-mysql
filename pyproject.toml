@@ -1,0 +1,18 @@
+[project]
+name = "rds-mysql"
+version = "0.1.0"
+description = "Pick an RDS MySQL cluster with fzf and connect, the password from SSM Parameter Store or typed in"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["boto3", "rich", "iterfzf"]
+
+[project.scripts]
+rds-mysql = "rds_mysql:run"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
